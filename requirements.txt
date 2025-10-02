@@ -1,0 +1,10 @@
+streamlit
+pandas
+plotly
+requests
+psutil
+schedule
+toml
+altair
+matplotlib
+speedtest-cli
