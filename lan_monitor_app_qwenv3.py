@@ -669,52 +669,69 @@ def get_summary_report():
 # Function to create charts for email (with fallback)
 def create_email_charts(report_data):
     charts = {}
-    
     try:
-        # Alert distribution chart
+        # 1) Alert distribution (categorical -> explicit color)
         if report_data['alerts_by_type']:
             alerts_df = pd.DataFrame(report_data['alerts_by_type'])
-            fig = px.pie(alerts_df, values='count', names='alert_type', 
-                         title='Alert Types Distribution')
-            img_bytes = fig.to_image(format="png", width=800, height=600)
-            charts['alerts_pie'] = img_bytes
-    
-        # Risk level distribution (if data available)
+            # Ensure stable color mapping by using the category as the color
+            fig = px.pie(
+                alerts_df,
+                values='count',
+                names='alert_type',
+                color='alert_type',  # <-- forces categorical coloring
+                title='Alert Types Distribution'
+            )
+            charts['alerts_pie'] = _finalize_and_export(fig)
+
+        # 2) Risk level distribution (explicit colors for High/Normal)
         if report_data['suspicious_connections'] > 0 or report_data['total_connections'] > 0:
-            risk_data = {
+            risk_df = pd.DataFrame({
                 'Risk Level': ['High Risk', 'Normal'],
-                'Count': [report_data['suspicious_connections'], 
-                         max(0, report_data['total_connections'] - report_data['suspicious_connections'])]
-            }
-            risk_df = pd.DataFrame(risk_data)
-            fig = px.bar(risk_df, x='Risk Level', y='Count', 
-                         title='Connection Risk Distribution')
-            img_bytes = fig.to_image(format="png", width=800, height=600)
-            charts['risk_bar'] = img_bytes
-    
-        # Network statistics chart
+                'Count': [
+                    report_data['suspicious_connections'],
+                    max(0, report_data['total_connections'] - report_data['suspicious_connections'])
+                ]
+            })
+            # Provide a discrete color sequence to avoid grayscale fallback
+            fig = px.bar(
+                risk_df,
+                x='Risk Level',
+                y='Count',
+                color='Risk Level',  # <-- categorical color
+                color_discrete_sequence=px.colors.qualitative.Set1,
+                title='Connection Risk Distribution'
+            )
+            fig.update_traces(marker_line_width=0.5)
+            charts['risk_bar'] = _finalize_and_export(fig)
+
+        # 3) Network statistics (categorical color as well)
         stats_data = {
             'Category': ['Total Devices', 'External Devices', 'Connections (24h)', 'Alerts (24h)'],
-            'Count': [report_data['total_devices'], report_data['external_devices'], 
-                     report_data['total_connections'], report_data['total_alerts']]
+            'Count': [report_data['total_devices'], report_data['external_devices'],
+                      report_data['total_connections'], report_data['total_alerts']]
         }
         if report_data['suspicious_connections'] > 0:
             stats_data['Category'].append('Suspicious Conn')
             stats_data['Count'].append(report_data['suspicious_connections'])
-            
-        stats_df = pd.DataFrame(stats_data)
-        fig = px.bar(stats_df, x='Category', y='Count', 
-                     title='Network Statistics Overview')
-        img_bytes = fig.to_image(format="png", width=800, height=600)
-        charts['stats_bar'] = img_bytes
-        
-    except Exception as e:
-        st.warning(f"Could not generate charts: {str(e)}. Sending report without charts.")
-        # Return empty charts dict if kaleido is not installed
-        charts = {}
-    
-    return charts
 
+        stats_df = pd.DataFrame(stats_data)
+        fig = px.bar(
+            stats_df,
+            x='Category',
+            y='Count',
+            color='Category',  # <-- categorical color
+            color_discrete_sequence=px.colors.qualitative.Bold,
+            title='Network Statistics Overview'
+        )
+        fig.update_traces(marker_line_width=0.5)
+        charts['stats_bar'] = _finalize_and_export(fig)
+
+    except Exception as e:
+        st.warning(f"Could not generate charts: {e}. Sending report without charts.")
+        charts = {}
+
+    return charts
+    
 # Function to send email report with attachments
 def send_email_report():
     try:
@@ -1832,4 +1849,5 @@ with tab5:
 # Add a rerun trigger to create auto-refresh effect
 time.sleep(1)
 st.rerun()
+
 
