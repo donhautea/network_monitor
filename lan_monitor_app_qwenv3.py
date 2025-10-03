@@ -1832,3 +1832,4 @@ with tab5:
 # Add a rerun trigger to create auto-refresh effect
 time.sleep(1)
 st.rerun()
+
