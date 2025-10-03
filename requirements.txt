@@ -8,6 +8,7 @@ toml
 altair
 matplotlib
 speedtest-cli
-kaleido
-plotly
+numpy>=1.26
+plotly>=5.22
+kaleido==0.2.1
 
