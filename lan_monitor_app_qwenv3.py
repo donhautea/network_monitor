@@ -1068,13 +1068,54 @@ if 'scheduler_thread' not in st.session_state:
     st.session_state.scheduler_thread.start()
 
 # Function to run ARP scan
+
 def scan_network():
+    """
+    Returns raw text representing ARP/neighbour entries.
+    Tries /proc/net/arp, then `ip neigh show`, then `arp -a`.
+    Falls back gracefully in cloud environments.
+    """
     try:
-        result = subprocess.run(['arp', '-a'], capture_output=True, text=True, timeout=10)
-        return result.stdout
+        # 1) Linux-native (works without extra binaries)
+        proc_arp = "/proc/net/arp"
+        if os.path.exists(proc_arp):
+            with open(proc_arp, "r", encoding="utf-8", errors="ignore") as f:
+                data = f.read()
+            # Tag the source so the parser can choose the right format
+            return "SOURCE:/proc/net/arp\n" + data
     except Exception as e:
-        st.error(f"ARP scan failed: {str(e)}")
-        return ""
+        st.warning(f"Reading /proc/net/arp failed: {e}")
+
+    # 2) `ip neigh show` (if the 'ip' tool exists)
+    try:
+        result = subprocess.run(['ip', 'neigh', 'show'],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            return "SOURCE:ip neigh\n" + result.stdout
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        st.warning(f"`ip neigh show` failed: {e}")
+
+    # 3) `arp -a` (legacy; not available in most containers)
+    try:
+        result = subprocess.run(['arp', '-a'],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            return "SOURCE:arp -a\n" + result.stdout
+    except FileNotFoundError:
+        # This is what you are seeing in Streamlit Cloud
+        pass
+    except Exception as e:
+        st.warning(f"`arp -a` failed: {e}")
+
+    # 4) Nothing worked — we are likely in a cloud sandbox
+    st.info("LAN ARP scan not available in this environment. "
+            "Tip: run this app on a local machine inside your network, "
+            "or deploy a small on-prem agent that reports back.")
+    return ""
+
+
 
 # Function to check if IP is external
 def is_external_ip(ip):
@@ -1225,34 +1266,82 @@ def detect_suspicious_activity(connections_df):
 
 # Function to parse ARP output
 def parse_arp_output(output):
+    """
+    Parse ARP/neighbour data from any of:
+      - /proc/net/arp (Linux)
+      - `ip neigh show`
+      - `arp -a`
+    Returns a list of device dicts.
+    """
     devices = []
-    lines = output.split('\n')
-    for line in lines:
-        # Match IP and MAC addresses (Windows/Linux formats)
-        match = re.search(r'(\d+\.\d+\.\d+\.\d+).*?([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}', line)
-        if match:
-            ip = match.group(1)
-            mac_match = re.search(r'([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}', line)
-            if mac_match:
-                mac = mac_match.group(0).replace('-', ':').lower()
-                vendor = known_macs.get(mac, "Unknown")
-                
-                # Check if external IP
-                is_external = is_external_ip(ip)
-                hostname = get_hostname(ip) if is_external else "Local Network"
-                location = get_geolocation(ip) if is_external else "Local"
-                isp = get_isp(ip) if is_external else "Local Network"
-                
-                devices.append({
-                    'IP': ip,
-                    'MAC': mac,
-                    'Vendor': vendor,
-                    'Last Seen': datetime.now(),
-                    'Is External': is_external,
-                    'Hostname': hostname,
-                    'Location': location,
-                    'ISP': isp
-                })
+    if not output:
+        return devices
+
+    # Ensure known_macs exists
+    try:
+        _km = known_macs
+    except NameError:
+        _km = {}
+
+    # Identify source
+    first_line, *rest = output.splitlines()
+    payload = "\n".join(rest) if first_line.startswith("SOURCE:") else output
+    source = first_line.replace("SOURCE:", "").strip() if first_line.startswith("SOURCE:") else "unknown"
+
+    now = datetime.now()
+
+    def add_device(ip, mac):
+        if not ip or not mac:
+            return
+        mac_norm = mac.replace('-', ':').lower()
+        vendor = _km.get(mac_norm, "Unknown")
+        # Check if external (usually false for ARP table)
+        ext = is_external_ip(ip)
+        hostname = get_hostname(ip) if ext else "Local Network"
+        location = get_geolocation(ip) if ext else "Local"
+        isp = get_isp(ip) if ext else "Local Network"
+        devices.append({
+            'IP': ip,
+            'MAC': mac_norm,
+            'Vendor': vendor,
+            'First Seen': now,         # filled by caller if needed
+            'Last Seen': now,
+            'Is External': ext,
+            'Hostname': hostname,
+            'Location': location,
+            'ISP': isp
+        })
+
+    if source == "/proc/net/arp":
+        # /proc/net/arp columns: IP address, HW type, Flags, HW address, Mask, Device
+        lines = [ln for ln in payload.splitlines() if ln.strip()]
+        if lines:
+            # skip header
+            for ln in lines[1:]:
+                parts = re.split(r"\s+", ln.strip())
+                if len(parts) >= 6:
+                    ip, _, _, mac, _, _ = parts[:6]
+                    # filter incomplete entries (MAC "00:00:00:00:00:00")
+                    if re.match(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$", mac) and mac != "00:00:00:00:00:00":
+                        add_device(ip, mac)
+
+    elif source == "ip neigh":
+        # Format examples:
+        # 192.168.1.10 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+        for ln in payload.splitlines():
+            m_ip = re.search(r'(\d+\.\d+\.\d+\.\d+)', ln)
+            m_mac = re.search(r'([0-9a-fA-F]{2}[:\-]){5}[0-9a-fA-F]{2}', ln)
+            if m_ip and m_mac:
+                add_device(m_ip.group(1), m_mac.group(0))
+
+    else:
+        # Try generic/arp -a parsing: look for IP + MAC anywhere on the line
+        for ln in payload.splitlines():
+            m_ip = re.search(r'(\d+\.\d+\.\d+\.\d+)', ln)
+            m_mac = re.search(r'([0-9a-fA-F]{2}[:\-]){5}[0-9a-fA-F]{2}', ln)
+            if m_ip and m_mac:
+                add_device(m_ip.group(1), m_mac.group(0))
+
     return devices
 
 # Function to detect external access
