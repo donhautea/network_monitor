@@ -667,6 +667,13 @@ def get_summary_report():
         }
 
 # Function to create charts for email (with fallback)
+def _finalize_and_export(fig, scale=2):
+    # Force opaque backgrounds (helps in some email clients)
+    fig.update_layout(paper_bgcolor="white", plot_bgcolor="white")
+    # Larger scale -> crisper PNGs
+    return fig.to_image(format="png", width=800, height=600, scale=scale)
+
+
 def create_email_charts(report_data):
     charts = {}
     try:
@@ -1849,5 +1856,6 @@ with tab5:
 # Add a rerun trigger to create auto-refresh effect
 time.sleep(1)
 st.rerun()
+
 
 
