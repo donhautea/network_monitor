@@ -26,6 +26,15 @@ import warnings
 import os
 import signal
 
+import plotly.io as pio
+import plotly.express as px
+
+# Use a colorful template and palette globally
+pio.templates.default = "plotly"                    # or "seaborn", "plotly_white"
+px.defaults.template = "plotly"
+px.defaults.color_discrete_sequence = px.colors.qualitative.Set2  # nice, readable colors
+px.defaults.color_continuous_scale = px.colors.sequential.Viridis # for heat/continuous
+
 # Critical ports that are commonly targeted by attackers
 CRITICAL_PORTS = {
     # Remote Access & Administration
@@ -1856,6 +1865,7 @@ with tab5:
 # Add a rerun trigger to create auto-refresh effect
 time.sleep(1)
 st.rerun()
+
 
 
 
