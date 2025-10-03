@@ -9,3 +9,4 @@ altair
 matplotlib
 speedtest-cli
 kaleido
+plotly_get_chrome
