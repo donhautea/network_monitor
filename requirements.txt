@@ -8,3 +8,4 @@ toml
 altair
 matplotlib
 speedtest-cli
+kaleido
