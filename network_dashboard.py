@@ -133,19 +133,46 @@ def kv_set(key: str, value):
     conn.commit()
 
 # ------------- Drive & Email -------------
+# --- replace your existing _gdrive_service() with this ---
 def _gdrive_service():
+    # Save the last error so we can show it in diagnostics
+    def _remember(err):
+        try:
+            st.session_state["_gdrive_last_err"] = str(err)
+        except Exception:
+            pass
+
+    # 1) Imports with helpful errors
     try:
         from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-        sa_info = st.secrets.get("gdrive_service_account")  # avoid KeyError
-        if not isinstance(sa_info, dict):
-            return None
-        creds = service_account.Credentials.from_service_account_info(
-            sa_info, scopes=["https://www.googleapis.com/auth/drive"]
-        )
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
-    except Exception:
+    except Exception as e:
+        _remember(f"Import google.oauth2 failed: {e}")
         return None
+    try:
+        from googleapiclient.discovery import build
+    except Exception as e:
+        _remember(f"Import googleapiclient failed: {e} (Install google-api-python-client)")
+        return None
+
+    # 2) Get service account creds from secrets
+    try:
+        sa_obj = st.secrets["gdrive_service_account"]  # mapping-like
+        sa_info = dict(sa_obj)  # coerce to plain dict
+    except Exception as e:
+        _remember(f"Missing/invalid gdrive_service_account secret: {e}")
+        return None
+
+    # 3) Build Drive client
+    try:
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        creds = service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
+        svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+        return svc
+    except Exception as e:
+        _remember(f"Drive client build failed: {e}")
+        return None
+
+
 
 
 def gdrive_sync_db():
@@ -1329,24 +1356,19 @@ except Exception as e:
 
 st.caption("Shading: **red** = downtime (outage start→restore), **green** = uptime (restore→next outage). Triangles show outage duration at each restore in hours; faint line = running average (hours).")
 
-with st.expander("🔧 Google Drive diagnostics"):
-    folder_id = st.secrets.get("gdrive_folder_id", "")
-    st.write("• gdrive_folder_id present:", bool(folder_id))
-
-    sa = st.secrets.get("gdrive_service_account", None)
-    st.write("• gdrive_service_account present:", isinstance(sa, dict))
-    if isinstance(sa, dict):
-        st.write("• service account email:", sa.get("client_email", "—"))
-
+with st.expander("🔧 Google Drive diagnostics", expanded=True):
+    st.write("• gdrive_folder_id present:", bool(st.secrets.get("gdrive_folder_id", "")))
     try:
-        svc = _gdrive_service()
-        st.write("• Drive client build:", "OK" if svc else "Not built")
-        if svc and folder_id:
-            meta = svc.files().get(
-                fileId=folder_id,
-                fields="id,name,driveId",
-                supportsAllDrives=True,
-            ).execute()
-            st.success(f"✅ Folder visible: {meta.get('name')} (driveId={meta.get('driveId','MyDrive')})")
-    except Exception as e:
-        st.error(f"Drive check failed: {e}")
+        sa = st.secrets["gdrive_service_account"]
+        st.write("• gdrive_service_account present:", True)
+        try:
+            st.write("• service account email:", dict(sa).get("client_email", "—"))
+        except Exception:
+            pass
+    except Exception:
+        st.write("• gdrive_service_account present:", False)
+
+    svc = _gdrive_service()
+    st.write("• Drive client build:", "OK" if svc else "Not built")
+    if not svc and "_gdrive_last_err" in st.session_state:
+        st.code(st.session_state["_gdrive_last_err"], language="text")
