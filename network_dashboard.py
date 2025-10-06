@@ -744,7 +744,7 @@ if auto_every_min and auto_every_min>0:
             <script>
                 setTimeout(function(){ window.parent.location.reload(); }, {ms});
             </script>
-            """.format(ms=interval_ms),
+            """,
             height=0
         )
     now = time.time(); last = st.session_state.get("_last_auto", 0)
