@@ -137,7 +137,9 @@ def _gdrive_service():
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
-        sa_info = dict(st.secrets["gdrive_service_account"])
+        sa_info = st.secrets.get("gdrive_service_account")  # avoid KeyError
+        if not isinstance(sa_info, dict):
+            return None
         creds = service_account.Credentials.from_service_account_info(
             sa_info, scopes=["https://www.googleapis.com/auth/drive"]
         )
@@ -145,24 +147,28 @@ def _gdrive_service():
     except Exception:
         return None
 
+
 def gdrive_sync_db():
     """
-    Uploads a safe snapshot of APP_DB_PATH to the configured Drive folder.
-
-    - Uses sqlite backup API to avoid locked/partial copies.
-    - Skips upload if MD5 matches what’s already on Drive.
-    - Returns (ok: bool, message: str)
+    Upload a consistent snapshot of APP_DB_PATH to Google Drive.
+    Handles My Drive and Shared Drives (supportsAllDrives=True).
     """
-    folder_id = None
-    try:
-        folder_id = st.secrets.get("gdrive_folder_id", None)
-    except Exception:
-        folder_id = None
+    folder_id = st.secrets.get("gdrive_folder_id")
     svc = _gdrive_service()
     if not svc or not folder_id:
         return False, "Drive not configured"
 
-    # 1) Make a consistent snapshot to a temp file
+    # 0) Verify folder is visible to the service account
+    try:
+        _ = svc.files().get(
+            fileId=folder_id,
+            fields="id,name,driveId",
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as e:
+        return False, f"Folder not accessible: {e}"
+
+    # 1) Make a consistent snapshot
     name = os.path.basename(APP_DB_PATH)
     snapshot_path = os.path.join(os.path.dirname(APP_DB_PATH), f".__tmp_{name}")
     try:
@@ -173,27 +179,27 @@ def gdrive_sync_db():
     local_md5 = _md5sum(snapshot_path)
 
     try:
-        # 2) Look for existing file in folder
+        # 2) Look for existing file in folder (My Drive or Shared Drives)
         q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
         resp = svc.files().list(
             q=q,
-            fields="files(id, name, md5Checksum, modifiedTime)",
-            pageSize=1
+            fields="files(id,name,md5Checksum,modifiedTime)",
+            pageSize=1,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
         ).execute()
         files = resp.get("files", [])
         file_id = files[0]["id"] if files else None
         remote_md5 = files[0].get("md5Checksum") if files else None
 
-        # 3) Skip if content identical
+        # 3) Skip if identical
         if remote_md5 and remote_md5 == local_md5:
             kv_set("last_drive_sync", {"ts": time.time(), "status": "skipped (no changes)", "md5": local_md5})
-            try:
-                os.remove(snapshot_path)
-            except Exception:
-                pass
+            try: os.remove(snapshot_path)
+            except Exception: pass
             return True, f"Synced (no changes) — md5 {local_md5}"
 
-        # 4) Upload/update with resumable upload
+        # 4) Upload/update
         from googleapiclient.http import MediaFileUpload
         media = MediaFileUpload(snapshot_path, mimetype="application/x-sqlite3", resumable=True)
 
@@ -201,7 +207,8 @@ def gdrive_sync_db():
             updated = svc.files().update(
                 fileId=file_id,
                 media_body=media,
-                fields="id, md5Checksum, modifiedTime"
+                fields="id,md5Checksum,modifiedTime",
+                supportsAllDrives=True,
             ).execute()
             new_md5 = updated.get("md5Checksum")
             kv_set("last_drive_sync", {"ts": time.time(), "status": "updated", "md5": new_md5, "file_id": updated.get("id")})
@@ -210,29 +217,25 @@ def gdrive_sync_db():
             created = svc.files().create(
                 body={"name": name, "parents": [folder_id]},
                 media_body=media,
-                fields="id, md5Checksum, modifiedTime"
+                fields="id,md5Checksum,modifiedTime",
+                supportsAllDrives=True,
             ).execute()
             new_md5 = created.get("md5Checksum")
             kv_set("last_drive_sync", {"ts": time.time(), "status": "created", "md5": new_md5, "file_id": created.get("id")})
             msg = f"Created on Drive — md5 {new_md5}, modified {created.get('modifiedTime')}"
 
-        # 5) Clean up temp
-        try:
-            os.remove(snapshot_path)
-        except Exception:
-            pass
+        try: os.remove(snapshot_path)
+        except Exception: pass
 
-        # 6) Integrity check
-        if new_md5 != local_md5 and new_md5 is not None:
+        if new_md5 and new_md5 != local_md5:
             return False, f"Warning: MD5 mismatch (local {local_md5} vs drive {new_md5})"
-        return True, "Synced to Drive"
+        return True, msg
 
     except Exception as e:
-        try:
-            os.remove(snapshot_path)
-        except Exception:
-            pass
+        try: os.remove(snapshot_path)
+        except Exception: pass
         return False, f"Drive sync failed: {e}"
+
 
 def _smtp_cfg():
     try:
