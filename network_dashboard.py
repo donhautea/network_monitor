@@ -270,11 +270,12 @@ def run_speed_test():
             out = subprocess.check_output([cli,"-f","json","--accept-license","--accept-gdpr"], text=True, timeout=120)
             data = json.loads(out)
             ping_ms = float(data.get("ping",{}).get("latency",0.0))
-            dl_bps  = float(data.get("download",{}).get("bandwidth",0.0))*8.0
+            dl_bps  = float(data.get("download",{}).get("bandwidth",0.0))*8.0  
             ul_bps  = float(data.get("upload",{}).get("bandwidth",0.0))*8.0
             download_mbps = round(dl_bps/1_000_000,3); upload_mbps = round(ul_bps/1_000_000,3)
-            server = data.get("server",{})
-            server_name = f"{server.get("name","")} - {server.get("location","")} ({server.get("country","")})"
+            server = data.get("server", {})
+            server_name = f"{server.get('name','')} - {server.get('location','')} ({server.get('country','')})"
+
             return ping_ms, download_mbps, upload_mbps, server_name
         except Exception as e2:
             return None, None, None, f"Ookla CLI failed: {e2}"
