@@ -134,64 +134,71 @@ def kv_set(key: str, value):
 
 # ------------- Drive & Email -------------
 
-# --- NEW: prefer an override folder id stored in DB when secrets folder is not accessible ---
+from googleapiclient.errors import HttpError
+
 def _resolve_drive_folder_id(svc):
     """
-    Determine which Drive folder ID to use:
-      1) kv override 'drive_folder_id' if set and accessible
-      2) secrets 'gdrive_folder_id' if accessible
-      3) create/find 'NetDash Backups' in the service account's My Drive, save to kv
-    Returns (folder_id, note) or (None, error_msg)
+    Return (folder_id, note) if we can access the configured folder, else (None, error_message).
+    Prefers:
+      1) st.secrets['gdrive_folder_id']
+      2) kv('gdrive_folder_id_override')
     """
-    def _accessible(fid):
-        try:
-            svc.files().get(fileId=fid, fields="id,name,driveId", supportsAllDrives=True).execute()
-            return True
-        except Exception:
-            return False
-
-    # 1) kv override
-    override_id = None
+    folder_id = None
     try:
-        override_id = kv_get("drive_folder_id", None)
+        folder_id = st.secrets.get("gdrive_folder_id", None)
     except Exception:
-        override_id = None
-    if override_id and _accessible(override_id):
-        return override_id, "using kv override"
+        pass
+    if not folder_id:
+        folder_id = kv_get("gdrive_folder_id_override", None)
+    if not folder_id:
+        return None, "No Drive folder configured (set gdrive_folder_id in secrets)."
 
-    # 2) secrets
-    secrets_id = None
     try:
-        secrets_id = st.secrets.get("gdrive_folder_id", None)
-    except Exception:
-        secrets_id = None
-    if secrets_id and _accessible(secrets_id):
-        # cache to kv for resiliency
-        kv_set("drive_folder_id", secrets_id)
-        return secrets_id, "using secrets folder_id"
-
-    # 3) fallback: create/find 'NetDash Backups' in SA My Drive
-    try:
-        # try to find an existing one by name owned by SA
-        resp = svc.files().list(
-            q="mimeType='application/vnd.google-apps.folder' and name='NetDash Backups' and 'me' in owners and trashed=false",
-            fields="files(id,name)",
-            pageSize=1,
+        meta = svc.files().get(
+            fileId=folder_id,
+            fields="id,name,driveId",
             supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            corpora="user"
         ).execute()
-        files = resp.get("files", [])
-        if files:
-            fid = files[0]["id"]
-        else:
-            body = {"name": "NetDash Backups", "mimeType": "application/vnd.google-apps.folder"}
-            created = svc.files().create(body=body, fields="id").execute()
-            fid = created["id"]
-        kv_set("drive_folder_id", fid)
-        return fid, "created/using 'NetDash Backups' in SA My Drive"
+        drive_note = "shared drive" if meta.get("driveId") else "my drive"
+        return folder_id, f"folder ok on {drive_note}: {meta.get('name','')}"
+    except HttpError as e:
+        return None, f"Folder not accessible: {e}"
     except Exception as e:
-        return None, f"Folder resolution failed: {e}"
+        return None, f"Folder check failed: {e}"
+
+
+def _resolve_drive_target(svc, filename: str):
+    """
+    Decide whether to UPDATE a specific file (gdrive_file_id) or work inside a folder.
+
+    Returns: (folder_id, file_id, note)
+      - If gdrive_file_id is accessible -> (None, file_id, 'using direct file_id')
+      - Else, (folder_id, None, folder_note)
+    """
+    # 1) Prefer explicit file id (Option B)
+    file_id = None
+    try:
+        file_id = st.secrets.get("gdrive_file_id", None)
+    except Exception:
+        pass
+    if not file_id:
+        file_id = kv_get("gdrive_file_id", None)
+
+    if file_id:
+        try:
+            svc.files().get(
+                fileId=file_id,
+                fields="id,name,md5Checksum,modifiedTime",
+                supportsAllDrives=True,
+            ).execute()
+            return None, file_id, "using direct file_id (will update)"
+        except Exception:
+            # Fall back to folder flow below
+            pass
+
+    # 2) Otherwise use/verify a folder (Option A)
+    folder_id, note = _resolve_drive_folder_id(svc)
+    return folder_id, None, note
 
 
 # --- replace your existing _gdrive_service() with this ---
@@ -241,20 +248,17 @@ def gdrive_sync_db():
     """
     Upload a safe snapshot of the DB to Google Drive.
 
-    - Verifies/chooses a writable folder (secrets -> kv override -> fallback).
-    - Uses sqlite backup API for a consistent snapshot.
-    - Skips upload if MD5 unchanged.
+    - UPDATE a specific file if gdrive_file_id is provided & accessible.
+    - Otherwise CREATE/UPDATE by name in the configured folder.
+    - Uses sqlite backup API and MD5 short-circuit.
     """
     svc = _gdrive_service()
     if not svc:
         return False, "Drive not configured (client not built)"
 
-    # Resolve folder ID robustly
-    folder_id, note = _resolve_drive_folder_id(svc)
-    if not folder_id:
-        return False, note or "Folder not accessible"
-
     name = os.path.basename(APP_DB_PATH)
+
+    # Make a consistent snapshot of the DB
     snapshot_path = os.path.join(os.path.dirname(APP_DB_PATH), f".__tmp_{name}")
     try:
         _sqlite_safe_copy(APP_DB_PATH, snapshot_path)
@@ -264,7 +268,54 @@ def gdrive_sync_db():
     local_md5 = _md5sum(snapshot_path)
 
     try:
-        # find existing file in the target folder
+        folder_id, direct_file_id, note = _resolve_drive_target(svc, name)
+
+        from googleapiclient.http import MediaFileUpload
+        media = MediaFileUpload(snapshot_path, mimetype="application/x-sqlite3", resumable=True)
+
+        # Helper to update an existing file id
+        def _update(fid, md5_before=None):
+            # md5 short-circuit if we already know it matches
+            if md5_before and md5_before == local_md5:
+                kv_set("last_drive_sync", {
+                    "ts": time.time(), "status": "skipped (no changes)",
+                    "md5": local_md5, "file_id": fid, "note": note
+                })
+                return True, f"Synced (no changes) — md5 {local_md5} ({note})"
+
+            updated = svc.files().update(
+                fileId=fid,
+                media_body=media,
+                fields="id,md5Checksum,modifiedTime",
+                supportsAllDrives=True
+            ).execute()
+            new_md5 = updated.get("md5Checksum")
+            kv_set("last_drive_sync", {
+                "ts": time.time(), "status": "updated", "md5": new_md5,
+                "file_id": updated["id"], "note": note
+            })
+            msg = f"Updated on Drive — md5 {new_md5}, modified {updated.get('modifiedTime')} ({note})"
+            if new_md5 and new_md5 != local_md5:
+                return False, f"Warning: MD5 mismatch (local {local_md5} vs drive {new_md5})"
+            return True, msg
+
+        # ---- Path 1: explicit file id (Option B) — always update, no create ----
+        if direct_file_id:
+            # fetch current md5 for short-circuit
+            meta = svc.files().get(
+                fileId=direct_file_id,
+                fields="id,name,md5Checksum,modifiedTime",
+                supportsAllDrives=True
+            ).execute()
+            remote_md5 = meta.get("md5Checksum")
+            ok, msg = _update(direct_file_id, md5_before=remote_md5)
+            return ok, msg
+
+        # ---- Path 2: folder flow (Option A) — update or create by name ----
+        if not folder_id:
+            return False, note or "Folder not accessible"
+
+        # Find existing file by name in the folder (works for Shared Drives)
         q = f"'{folder_id}' in parents and name='{name}' and trashed=false"
         resp = svc.files().list(
             q=q,
@@ -277,27 +328,20 @@ def gdrive_sync_db():
         file_id = files[0]["id"] if files else None
         remote_md5 = files[0].get("md5Checksum") if files else None
 
-        # no change → skip
+        # short-circuit when unchanged
         if remote_md5 and remote_md5 == local_md5:
-            kv_set("last_drive_sync", {"ts": time.time(), "status": "skipped (no changes)", "md5": local_md5, "folder_id": folder_id, "note": note})
-            try: os.remove(snapshot_path)
-            except Exception: pass
+            kv_set("last_drive_sync", {
+                "ts": time.time(), "status": "skipped (no changes)", "md5": local_md5,
+                "folder_id": folder_id, "note": note
+            })
             return True, f"Synced (no changes) — md5 {local_md5} ({note})"
 
-        from googleapiclient.http import MediaFileUpload
-        media = MediaFileUpload(snapshot_path, mimetype="application/x-sqlite3", resumable=True)
-
         if file_id:
-            updated = svc.files().update(
-                fileId=file_id,
-                media_body=media,
-                fields="id,md5Checksum,modifiedTime",
-                supportsAllDrives=True
-            ).execute()
-            new_md5 = updated.get("md5Checksum")
-            kv_set("last_drive_sync", {"ts": time.time(), "status": "updated", "md5": new_md5, "file_id": updated["id"], "folder_id": folder_id, "note": note})
-            msg = f"Updated on Drive — md5 {new_md5}, modified {updated.get('modifiedTime')} ({note})"
-        else:
+            ok, msg = _update(file_id)
+            return ok, msg
+
+        # Create (requires Shared Drive or user quota). Catch quota error cleanly.
+        try:
             created = svc.files().create(
                 body={"name": name, "parents": [folder_id]},
                 media_body=media,
@@ -305,20 +349,32 @@ def gdrive_sync_db():
                 supportsAllDrives=True
             ).execute()
             new_md5 = created.get("md5Checksum")
-            kv_set("last_drive_sync", {"ts": time.time(), "status": "created", "md5": new_md5, "file_id": created["id"], "folder_id": folder_id, "note": note})
+            kv_set("last_drive_sync", {
+                "ts": time.time(), "status": "created", "md5": new_md5,
+                "file_id": created["id"], "folder_id": folder_id, "note": note
+            })
             msg = f"Created on Drive — md5 {new_md5}, modified {created.get('modifiedTime')} ({note})"
+            if new_md5 and new_md5 != local_md5:
+                return False, f"Warning: MD5 mismatch (local {local_md5} vs drive {new_md5})"
+            return True, msg
+        except HttpError as e:
+            et = str(e)
+            if "storageQuotaExceeded" in et or "Service Accounts do not have storage quota" in et:
+                return False, (
+                    "Create failed due to service-account quota. "
+                    "Fix by either: (A) use a Shared Drive and grant the service account Content manager, "
+                    "or (B) pre-create the file in your My Drive, share it to the service account as Editor, "
+                    "and set gdrive_file_id in secrets so we update it."
+                )
+            return False, f"Drive sync failed: {e}"
+
     except Exception as e:
-        try: os.remove(snapshot_path)
-        except Exception: pass
         return False, f"Drive sync failed: {e}"
     finally:
-        try: os.remove(snapshot_path)
-        except Exception: pass
-
-    # light integrity check
-    if new_md5 and new_md5 != local_md5:
-        return False, f"Warning: MD5 mismatch (local {local_md5} vs drive {new_md5})"
-    return True, msg
+        try:
+            os.remove(snapshot_path)
+        except Exception:
+            pass
 
 
 
