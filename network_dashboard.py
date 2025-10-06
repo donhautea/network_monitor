@@ -1325,3 +1325,51 @@ except Exception as e:
     st.caption(f"Auto Drive sync skipped: {e}")
 
 st.caption("Shading: **red** = downtime (outage start→restore), **green** = uptime (restore→next outage). Triangles show outage duration at each restore in hours; faint line = running average (hours).")
+
+with st.expander("🔧 Google Drive diagnostics"):
+    has_folder = False
+    has_creds = False
+    svc_ok = False
+    folder_id = None
+    missing = []
+
+    try:
+        folder_id = st.secrets.get("gdrive_folder_id", "")
+        has_folder = bool(folder_id)
+        if not has_folder:
+            missing.append("gdrive_folder_id")
+    except Exception:
+        missing.append("gdrive_folder_id")
+
+    try:
+        sa = st.secrets.get("gdrive_service_account", {})
+        has_creds = isinstance(sa, dict) and bool(sa.get("client_email")) and bool(sa.get("private_key"))
+        if not has_creds:
+            missing.append("gdrive_service_account")
+    except Exception:
+        missing.append("gdrive_service_account")
+
+    st.write("• gdrive_folder_id present:", has_folder)
+    st.write("• gdrive_service_account present:", has_creds)
+    if missing:
+        st.error("Missing: " + ", ".join(missing))
+
+    # Try to build a Drive client and list the folder’s files (requires sharing + APIs installed)
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        creds = service_account.Credentials.from_service_account_info(
+            dict(st.secrets["gdrive_service_account"]),
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        svc = build("drive", "v3", credentials=creds, cache_discovery=False)
+        svc_ok = True
+        st.write("• Drive client build:", "OK")
+        if folder_id:
+            resp = svc.files().list(q=f"'{folder_id}' in parents and trashed=false", pageSize=5, fields="files(id,name)").execute()
+            st.write("• Folder list sample:", resp.get("files", []))
+            st.success("✅ Secrets valid and Drive folder is accessible.")
+    except Exception as e:
+        st.error(f"Drive client/list failed: {e}")
+
+
