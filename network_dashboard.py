@@ -253,34 +253,111 @@ def get_wifi_ssid() -> str:
     return ""
 
 def run_speed_test():
+    # 1) Try python speedtest-cli
     if speedtest:
         try:
-            stest = speedtest.Speedtest(); stest.get_servers([]); best = stest.get_best_server()
-            ping_ms = float(stest.results.ping); download_mbps = round(stest.download()/1_000_000,3); upload_mbps = round(stest.upload()/1_000_000,3)
+            stest = speedtest.Speedtest()
+            stest.get_servers([])
+            best = stest.get_best_server()
+            ping_ms = float(stest.results.ping)
+            download_mbps = round(stest.download() / 1_000_000, 3)
+            upload_mbps = round(stest.upload() / 1_000_000, 3)
             server_name = f"{best.get('sponsor','')} - {best.get('name','')} ({best.get('country','')})"
             return ping_ms, download_mbps, upload_mbps, server_name
         except Exception as e:
-            err = f"python speedtest-cli failed: {e}"
+            py_err = f"python speedtest-cli failed: {e}"
     else:
-        err = "python speedtest-cli not installed"
+        py_err = "python speedtest-cli not installed"
 
+    # 2) Try Ookla CLI (speedtest)
     cli = _shutil.which("speedtest")
-    if cli:
+    if not cli:
+        return None, None, None, py_err + " | Ookla CLI not found on PATH"
+
+    import subprocess, json
+
+    def _try_ookla(args):
+        # Run CLI, capture both stdout/stderr
+        p = subprocess.run(
+            [cli] + args,
+            text=True,
+            capture_output=True,
+            timeout=180
+        )
+        out = (p.stdout or "").strip()
+        err = (p.stderr or "").strip()
+        return p.returncode, out, err
+
+    # Common flag sets across versions
+    attempts = [
+        # Newer versions prefer --format
+        ["--format=json", "--accept-license", "--accept-gdpr"],
+        # Some builds still accept -f json
+        ["-f", "json", "--accept-license", "--accept-gdpr"],
+        # Some environments are picky about progress/UI
+        ["--format=json", "--progress=no", "--accept-license", "--accept-gdpr"],
+    ]
+
+    last_err = py_err
+    for args in attempts:
         try:
-            out = subprocess.check_output([cli,"-f","json","--accept-license","--accept-gdpr"], text=True, timeout=120)
-            data = json.loads(out)
-            ping_ms = float(data.get("ping",{}).get("latency",0.0))
-            dl_bps  = float(data.get("download",{}).get("bandwidth",0.0))*8.0  
-            ul_bps  = float(data.get("upload",{}).get("bandwidth",0.0))*8.0
-            download_mbps = round(dl_bps/1_000_000,3); upload_mbps = round(ul_bps/1_000_000,3)
-            server = data.get("server", {})
-            server_name = f"{server.get('name','')} - {server.get('location','')} ({server.get('country','')})"
+            rc, out, err = _try_ookla(args)
+            if rc != 0:
+                last_err = f"Ookla CLI exit {rc}: {err or 'no stderr'}"
+                continue
+            if not out:
+                last_err = f"Ookla CLI produced no output. stderr: {err or 'empty'}"
+                continue
 
-            return ping_ms, download_mbps, upload_mbps, server_name
-        except Exception as e2:
-            return None, None, None, f"Ookla CLI failed: {e2}"
+            # Some proxies inject HTML. Guard that.
+            if out.lstrip().startswith("<") or out.lstrip().startswith("<?xml"):
+                last_err = "Ookla CLI returned non-JSON (HTML/XML). Possible captive portal/proxy."
+                continue
 
-    return None, None, None, err
+            # Parse JSON (strip BOM if any)
+            out_clean = out.lstrip("\ufeff").strip()
+            data = json.loads(out_clean)
+
+            # Validate expected fields (schema differs by versions)
+            # v1: data["ping"]["latency"], data["download"]["bandwidth"], data["upload"]["bandwidth"]
+            # v2: sometimes float bps directly; we handle both
+            ping_ms = float(data.get("ping", {}).get("latency", data.get("ping", 0.0)))
+
+            def _extract_bps(section):
+                sec = data.get(section, {})
+                # Ookla JSON typically gives "bandwidth" in bytes/s, multiply by 8 to get bits/s
+                bw = sec.get("bandwidth")
+                if bw is not None:
+                    return float(bw) * 8.0
+                # Some variants expose "bytes" or "bps"
+                bps = sec.get("bps")
+                if bps is not None:
+                    return float(bps)
+                return None
+
+            dl_bps = _extract_bps("download")
+            ul_bps = _extract_bps("upload")
+
+            if dl_bps is None or ul_bps is None:
+                last_err = "Ookla JSON missing bandwidth fields."
+                continue
+
+            download_mbps = round(dl_bps / 1_000_000, 3)
+            upload_mbps = round(ul_bps / 1_000_000, 3)
+
+            srv = data.get("server", {})
+            # Some builds use "name"/"location"/"country"; others have different keys
+            server_name = f"{srv.get('name','')} - {srv.get('location','')} ({srv.get('country','')})".strip()
+
+            return ping_ms, download_mbps, upload_mbps, server_name or "Ookla server"
+        except json.JSONDecodeError as je:
+            last_err = f"JSON parse error: {je}"
+        except Exception as e:
+            last_err = f"Ookla CLI error: {e}"
+
+    # If everything failed, return a useful message
+    return None, None, None, last_err
+
 
 def classify_online(download_mbps: Optional[float], ping_ms: Optional[float], dl_threshold: float = 0.1) -> int:
     try:
