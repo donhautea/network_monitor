@@ -11,9 +11,11 @@ speedtest-cli
 numpy>=1.26
 plotly>=5.22
 kaleido==0.2.1
-google-api-python-client 
-google-auth 
-google-auth-httplib2 
-google-auth-oauthlib
+google-api-python-client>=2.146.0
+google-auth>=2.35.0
+google-auth-httplib2>=0.2.0
+httplib2>=0.22.0
+
+
 
 
