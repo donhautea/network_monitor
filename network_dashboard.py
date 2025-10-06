@@ -13,6 +13,22 @@ from typing import Optional, Tuple, List
 import pandas as pd
 import streamlit as st
 
+import hashlib
+from contextlib import closing
+
+def _sqlite_safe_copy(src_path: str, dst_path: str):
+    """Create a consistent snapshot using the sqlite3 backup API."""
+    with closing(sqlite3.connect(src_path, check_same_thread=False)) as src, \
+         closing(sqlite3.connect(dst_path)) as dst:
+        src.backup(dst)  # atomic, consistent
+
+def _md5sum(path: str, chunk=1024*1024) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
 try:
     import altair as alt
 except Exception:
@@ -91,7 +107,10 @@ def insert_metric(row: dict):
 def fetch_metrics(start: Optional[datetime] = None, end: Optional[datetime] = None) -> pd.DataFrame:
     conn = _conn()
     if start and end:
-        df = pd.read_sql_query("SELECT * FROM metrics WHERE ts >= ? AND ts < ? ORDER BY ts ASC", conn, params=(start.isoformat(), end.isoformat()))
+        df = pd.read_sql_query(
+            "SELECT * FROM metrics WHERE ts >= ? AND ts < ? ORDER BY ts ASC",
+            conn, params=(start.isoformat(), end.isoformat())
+        )
     else:
         df = pd.read_sql_query("SELECT * FROM metrics ORDER BY ts ASC", conn)
     if not df.empty:
@@ -127,6 +146,13 @@ def _gdrive_service():
         return None
 
 def gdrive_sync_db():
+    """
+    Uploads a safe snapshot of APP_DB_PATH to the configured Drive folder.
+
+    - Uses sqlite backup API to avoid locked/partial copies.
+    - Skips upload if MD5 matches what’s already on Drive.
+    - Returns (ok: bool, message: str)
+    """
     folder_id = None
     try:
         folder_id = st.secrets.get("gdrive_folder_id", None)
@@ -135,20 +161,77 @@ def gdrive_sync_db():
     svc = _gdrive_service()
     if not svc or not folder_id:
         return False, "Drive not configured"
+
+    # 1) Make a consistent snapshot to a temp file
     name = os.path.basename(APP_DB_PATH)
+    snapshot_path = os.path.join(os.path.dirname(APP_DB_PATH), f".__tmp_{name}")
     try:
-        q = f"'{folder_id}' in parents and trashed = false"
-        resp = svc.files().list(q=q, fields="files(id,name)").execute()
-        files = resp.get("files", [])
-        match = next((f for f in files if f.get("name") == name), None)
-        from googleapiclient.http import MediaFileUpload
-        media = MediaFileUpload(APP_DB_PATH, resumable=True)
-        if match:
-            svc.files().update(fileId=match["id"], media_body=media).execute()
-        else:
-            svc.files().create(body={"name": name, "parents": [folder_id]}, media_body=media).execute()
-        return True, "Synced to Drive"
+        _sqlite_safe_copy(APP_DB_PATH, snapshot_path)
     except Exception as e:
+        return False, f"Snapshot failed: {e}"
+
+    local_md5 = _md5sum(snapshot_path)
+
+    try:
+        # 2) Look for existing file in folder
+        q = f"'{folder_id}' in parents and name = '{name}' and trashed = false"
+        resp = svc.files().list(
+            q=q,
+            fields="files(id, name, md5Checksum, modifiedTime)",
+            pageSize=1
+        ).execute()
+        files = resp.get("files", [])
+        file_id = files[0]["id"] if files else None
+        remote_md5 = files[0].get("md5Checksum") if files else None
+
+        # 3) Skip if content identical
+        if remote_md5 and remote_md5 == local_md5:
+            kv_set("last_drive_sync", {"ts": time.time(), "status": "skipped (no changes)", "md5": local_md5})
+            try:
+                os.remove(snapshot_path)
+            except Exception:
+                pass
+            return True, f"Synced (no changes) — md5 {local_md5}"
+
+        # 4) Upload/update with resumable upload
+        from googleapiclient.http import MediaFileUpload
+        media = MediaFileUpload(snapshot_path, mimetype="application/x-sqlite3", resumable=True)
+
+        if file_id:
+            updated = svc.files().update(
+                fileId=file_id,
+                media_body=media,
+                fields="id, md5Checksum, modifiedTime"
+            ).execute()
+            new_md5 = updated.get("md5Checksum")
+            kv_set("last_drive_sync", {"ts": time.time(), "status": "updated", "md5": new_md5, "file_id": updated.get("id")})
+            msg = f"Updated on Drive — md5 {new_md5}, modified {updated.get('modifiedTime')}"
+        else:
+            created = svc.files().create(
+                body={"name": name, "parents": [folder_id]},
+                media_body=media,
+                fields="id, md5Checksum, modifiedTime"
+            ).execute()
+            new_md5 = created.get("md5Checksum")
+            kv_set("last_drive_sync", {"ts": time.time(), "status": "created", "md5": new_md5, "file_id": created.get("id")})
+            msg = f"Created on Drive — md5 {new_md5}, modified {created.get('modifiedTime')}"
+
+        # 5) Clean up temp
+        try:
+            os.remove(snapshot_path)
+        except Exception:
+            pass
+
+        # 6) Integrity check
+        if new_md5 != local_md5 and new_md5 is not None:
+            return False, f"Warning: MD5 mismatch (local {local_md5} vs drive {new_md5})"
+        return True, "Synced to Drive"
+
+    except Exception as e:
+        try:
+            os.remove(snapshot_path)
+        except Exception:
+            pass
         return False, f"Drive sync failed: {e}"
 
 def _smtp_cfg():
@@ -169,7 +252,7 @@ def _smtp_cfg():
 def _send_email_with_attachments(subject: str, to_email: str, html_body: str, attachments: List[Tuple[str, bytes, str]]):
     import smtplib
     from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
+    from email.mime_text import MIMEText
     from email.mime.base import MIMEBase
     from email import encoders
 
@@ -274,8 +357,6 @@ def run_speed_test():
     if not cli:
         return None, None, None, py_err + " | Ookla CLI not found on PATH"
 
-    import subprocess, json
-
     def _try_ookla(args):
         # Run CLI, capture both stdout/stderr
         p = subprocess.run(
@@ -290,11 +371,8 @@ def run_speed_test():
 
     # Common flag sets across versions
     attempts = [
-        # Newer versions prefer --format
         ["--format=json", "--accept-license", "--accept-gdpr"],
-        # Some builds still accept -f json
         ["-f", "json", "--accept-license", "--accept-gdpr"],
-        # Some environments are picky about progress/UI
         ["--format=json", "--progress=no", "--accept-license", "--accept-gdpr"],
     ]
 
@@ -319,17 +397,13 @@ def run_speed_test():
             data = json.loads(out_clean)
 
             # Validate expected fields (schema differs by versions)
-            # v1: data["ping"]["latency"], data["download"]["bandwidth"], data["upload"]["bandwidth"]
-            # v2: sometimes float bps directly; we handle both
             ping_ms = float(data.get("ping", {}).get("latency", data.get("ping", 0.0)))
 
             def _extract_bps(section):
                 sec = data.get(section, {})
-                # Ookla JSON typically gives "bandwidth" in bytes/s, multiply by 8 to get bits/s
                 bw = sec.get("bandwidth")
                 if bw is not None:
                     return float(bw) * 8.0
-                # Some variants expose "bytes" or "bps"
                 bps = sec.get("bps")
                 if bps is not None:
                     return float(bps)
@@ -346,7 +420,6 @@ def run_speed_test():
             upload_mbps = round(ul_bps / 1_000_000, 3)
 
             srv = data.get("server", {})
-            # Some builds use "name"/"location"/"country"; others have different keys
             server_name = f"{srv.get('name','')} - {srv.get('location','')} ({srv.get('country','')})".strip()
 
             return ping_ms, download_mbps, upload_mbps, server_name or "Ookla server"
@@ -355,9 +428,7 @@ def run_speed_test():
         except Exception as e:
             last_err = f"Ookla CLI error: {e}"
 
-    # If everything failed, return a useful message
     return None, None, None, last_err
-
 
 def classify_online(download_mbps: Optional[float], ping_ms: Optional[float], dl_threshold: float = 0.1) -> int:
     try:
@@ -370,13 +441,16 @@ def compute_uptime(df: pd.DataFrame) -> Tuple[float, float]:
         return 0.0, 0.0
     online = int(df["is_online"].sum())
     total = int(len(df))
-    uptime = 100.0*online/max(total,1)
-    return uptime, 100.0-uptime
+    uptime = 100.0 * online / max(total, 1)
+    return uptime, 100.0 - uptime
 
 # -------- Outage bookkeeping --------
 def _insert_outage_start(conn, start_ts: str, last_online_before: Optional[str], start_sample_id: int):
     try:
-        conn.execute("INSERT OR IGNORE INTO outages (start_ts,last_online_before,start_sample_id) VALUES (?,?,?)", (start_ts,last_online_before,start_sample_id))
+        conn.execute(
+            "INSERT OR IGNORE INTO outages (start_ts,last_online_before,start_sample_id) VALUES (?,?,?)",
+            (start_ts, last_online_before, start_sample_id)
+        )
         conn.commit()
     except Exception:
         pass
@@ -389,12 +463,15 @@ def _close_latest_outage(conn, end_ts: str, first_online_after: str, end_sample_
         return
     outage_id, start_ts = row
     try:
-        start_dt = datetime.fromisoformat(start_ts.replace("Z",""))
-        end_dt = datetime.fromisoformat(end_ts.replace("Z",""))
-        duration = int((end_dt-start_dt).total_seconds())
+        start_dt = datetime.fromisoformat(start_ts.replace("Z", ""))
+        end_dt = datetime.fromisoformat(end_ts.replace("Z", ""))
+        duration = int((end_dt - start_dt).total_seconds())
     except Exception:
         duration = None
-    cur.execute("UPDATE outages SET end_ts=?, duration_seconds=?, first_online_after=?, end_sample_id=? WHERE id=?", (end_ts,duration,first_online_after,end_sample_id,outage_id))
+    cur.execute(
+        "UPDATE outages SET end_ts=?, duration_seconds=?, first_online_after=?, end_sample_id=? WHERE id=?",
+        (end_ts, duration, first_online_after, end_sample_id, outage_id)
+    )
     conn.commit()
 
 def analyze_outage_transition(latest_sample_id: int):
@@ -402,22 +479,22 @@ def analyze_outage_transition(latest_sample_id: int):
     df = pd.read_sql_query("SELECT id, ts, is_online FROM metrics ORDER BY ts DESC LIMIT 2", conn)
     if df.empty:
         return None
-    if len(df)==1:
+    if len(df) == 1:
         try:
-            cur_online = int(df.loc[0,"is_online"]) if pd.notna(df.loc[0,"is_online"]) else 0
+            cur_online = int(df.loc[0, "is_online"]) if pd.notna(df.loc[0, "is_online"]) else 0
         except Exception:
             cur_online = 0
-        if cur_online==0:
-            _insert_outage_start(conn, str(df.loc[0,"ts"]), None, int(df.loc[0,"id"]))
+        if cur_online == 0:
+            _insert_outage_start(conn, str(df.loc[0, "ts"]), None, int(df.loc[0, "id"]))
             return "start"
         return None
     cur, prev = df.iloc[0], df.iloc[1]
     cur_online = int(cur["is_online"]) if pd.notna(cur["is_online"]) else 0
     prev_online = int(prev["is_online"]) if pd.notna(prev["is_online"]) else 0
-    if prev_online==1 and cur_online==0:
+    if prev_online == 1 and cur_online == 0:
         _insert_outage_start(conn, str(cur["ts"]), str(prev["ts"]), int(cur["id"]))
         return "start"
-    elif prev_online==0 and cur_online==1:
+    elif prev_online == 0 and cur_online == 1:
         _close_latest_outage(conn, str(cur["ts"]), str(cur["ts"]), int(cur["id"]))
         return "end"
     return None
@@ -519,7 +596,6 @@ def make_combined_chart_image(df: pd.DataFrame, df_out: pd.DataFrame) -> bytes:
         color = "red" if b["state"]=="down" else "green"
         ax1.axvspan(pd.to_datetime(b["start"]), pd.to_datetime(b["end"]), color=color, alpha=0.12)
 
-    # Vertical rules for outage starts/ends (using the SAME df_out filtered for the window)
     df_out2 = df_out.copy()
     if not df_out2.empty:
         for col in ["start_ts","end_ts"]:
@@ -725,6 +801,62 @@ def build_summary_html(df_metrics_window: pd.DataFrame, df_out_window: pd.DataFr
     """
     return html
 
+def _smtp_cfg():
+    try:
+        smtp_cfg = dict(st.secrets.get("smtp", {}))
+    except Exception:
+        smtp_cfg = None
+    if not smtp_cfg:
+        smtp_cfg = {
+            "host": "smtp.gmail.com",
+            "port": 587,
+            "username": os.environ.get("NETDASH_SMTP_USER", ""),
+            "password": os.environ.get("NETDASH_SMTP_PASS", ""),
+            "use_tls": True,
+        }
+    return smtp_cfg
+
+def _send_email_with_attachments(subject: str, to_email: str, html_body: str, attachments: List[Tuple[str, bytes, str]]):
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+
+    cfg = _smtp_cfg()
+    host = cfg.get("host", "smtp.gmail.com")
+    port = int(cfg.get("port", 587))
+    user = cfg.get("username", "")
+    pwd  = cfg.get("password", "")
+    use_tls = bool(cfg.get("use_tls", True))
+    if not (host and port and user and pwd):
+        return False, "SMTP not configured"
+
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"] = user
+    msg["To"] = to_email
+    msg.attach(MIMEText(html_body, "html"))
+
+    for fname, data, mime in attachments or []:
+        maintype, subtype = mime.split("/", 1)
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{fname}"')
+        msg.attach(part)
+
+    try:
+        server = smtplib.SMTP(host, port, timeout=30)
+        if use_tls:
+            server.starttls()
+        server.login(user, pwd)
+        server.sendmail(user, [to_email], msg.as_string())
+        server.quit()
+        return True, "Email sent"
+    except Exception as e:
+        return False, f"Email send failed: {e}"
+
 def email_bucket_chart_and_summary(to_email: str, bucket_df: pd.DataFrame, chart_png: bytes, title_suffix: str, df_metrics_24h: pd.DataFrame, df_out_window: pd.DataFrame):
     rows = ["<tr><th>Bucket start</th><th>Bucket end</th><th>Outages</th><th>Downtime (hours)</th></tr>"]
     if not bucket_df.empty:
@@ -747,6 +879,8 @@ with st.sidebar:
     auto_every_min = st.number_input("Auto test every (minutes)", min_value=0, value=0, step=1, help="Set > 0 to auto-run speed tests.")
     date_range = st.date_input("Filter date range", value=(), help="Optional filter for charts and KPIs.")
     show_raw = st.checkbox("Show raw dataset (metrics)", value=False)
+
+    # (Removed stray buggy line here)
 
     st.subheader("Bucket options")
     group_mode = st.selectbox("Group by (bucket table)", ["Hourly", "Every N hours", "Daily", "Weekly", "Monthly"], index=2)
@@ -781,20 +915,25 @@ with st.sidebar:
         df_metrics_window = fetch_metrics(sdt, edt)
         conn_tmp = _conn()
         if sdt and edt:
-            df_out_window = pd.read_sql_query("SELECT * FROM outages WHERE (start_ts < ?) AND (COALESCE(end_ts, ?) > ?) ORDER BY start_ts ASC", conn_tmp, params=(edt.isoformat(), edt.isoformat(), sdt.isoformat()))
+            df_out_window = pd.read_sql_query(
+                "SELECT * FROM outages WHERE (start_ts < ?) AND (COALESCE(end_ts, ?) > ?) ORDER BY start_ts ASC",
+                conn_tmp, params=(edt.isoformat(), edt.isoformat(), sdt.isoformat())
+            )
         else:
             df_out_window = pd.read_sql_query("SELECT * FROM outages ORDER BY start_ts ASC", conn_tmp)
         # Chart PNG for this exact window
         chart_png = make_combined_chart_image(df_metrics_window if not df_metrics_window.empty else fetch_metrics(), df_out_window)
         # Bucket table for the same window
-        # Transform tuple so compute_bucket_table can use it
         dr = (sdt.date(), (edt - timedelta(days=1)).date()) if (sdt and edt) else ()
         bucket_df = compute_bucket_table(df_out_window, dr, group_mode, int(n_hours), anchor_dt)
         # 24h rolling KPIs
         end_auto = datetime.now()
         start_auto = end_auto - timedelta(days=1)
         df_24h = fetch_metrics(start_auto, end_auto)
-        ok,msg = email_bucket_chart_and_summary(str(report_to), bucket_df, chart_png, title_suffix=f"(on-demand)", df_metrics_24h=df_24h, df_out_window=df_out_window)
+        ok,msg = email_bucket_chart_and_summary(
+            str(report_to), bucket_df, chart_png, title_suffix=f"(on-demand)",
+            df_metrics_24h=df_24h, df_out_window=df_out_window
+        )
         st.info(f"Email report: {msg}")
 
     st.caption("Auto-email every 3 hours: uses last 24h window with 3-hour buckets.")
@@ -809,26 +948,40 @@ with st.sidebar:
             csv = df_all.to_csv(index=False).encode("utf-8")
             st.download_button("Download metrics.csv", data=csv, file_name="network_metrics.csv", mime="text/csv", use_container_width=True)
 
+    # -------- Manual Google Drive sync UI --------
+    st.divider()
+    st.subheader("Google Drive")
+    if st.button("Sync DB to Drive", use_container_width=True):
+        ok, msg = gdrive_sync_db()
+        (st.success if ok else st.error)(f"Drive sync: {msg}")
+
+    last_sync = kv_get("last_drive_sync", None)
+    if last_sync:
+        ts_sync = datetime.fromtimestamp(float(last_sync.get("ts", 0))).strftime("%Y-%m-%d %H:%M:%S")
+        st.caption(f"Last Drive sync: {last_sync.get('status')} at {ts_sync} (md5 {last_sync.get('md5', '—')})")
+    else:
+        st.caption("No Drive sync recorded yet.")
+
 # Auto refresh/run
-if auto_every_min and auto_every_min>0:
-    interval_ms = int(auto_every_min*60*1000); interval_s = int(auto_every_min*60)
+if auto_every_min and auto_every_min > 0:
+    interval_ms = int(auto_every_min * 60 * 1000); interval_s = int(auto_every_min * 60)
     try:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=interval_ms, key=f"auto_tick_{interval_ms}")
     except Exception:
         import streamlit.components.v1 as components
         components.html(
-            """
+            f"""
             <script>
-                setTimeout(function(){ window.parent.location.reload(); }, {ms});
+                setTimeout(function() {{ window.parent.location.reload(); }}, {interval_ms});
             </script>
             """,
             height=0
         )
     now = time.time(); last = st.session_state.get("_last_auto", 0)
-    if (last==0) or (now-last>=interval_s):
-        st.session_state["_run_now"]=True; st.session_state["_last_auto"]=now
-    nxt = datetime.now()+timedelta(seconds=max(0, interval_s - (now-last if last else 0)))
+    if (last == 0) or (now - last >= interval_s):
+        st.session_state["_run_now"] = True; st.session_state["_last_auto"] = now
+    nxt = datetime.now() + timedelta(seconds=max(0, interval_s - (now - last if last else 0)))
     st.caption(f"Auto mode on: every {auto_every_min} min. Next run around {nxt:%Y-%m-%d %H:%M:%S}.")
 else:
     st.caption("Auto mode off.")
@@ -840,7 +993,18 @@ if st.session_state.get("_run_now"):
         public_ip = get_public_ip(); local_ip = get_local_ip(); ssid = get_wifi_ssid()
         ts = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         is_online = classify_online(dl, ping_ms, dl_threshold)
-        insert_metric({"ts":ts,"ping_ms":ping_ms if ping_ms is not None else None,"download_mbps":dl if dl is not None else None,"upload_mbps":ul if ul is not None else None,"public_ip":public_ip,"local_ip":local_ip,"ssid":ssid,"server_name":server_name,"is_online":is_online,"notes":None})
+        insert_metric({
+            "ts": ts,
+            "ping_ms": ping_ms if ping_ms is not None else None,
+            "download_mbps": dl if dl is not None else None,
+            "upload_mbps": ul if ul is not None else None,
+            "public_ip": public_ip,
+            "local_ip": local_ip,
+            "ssid": ssid,
+            "server_name": server_name,
+            "is_online": is_online,
+            "notes": None
+        })
         conn=_conn(); row=conn.execute("SELECT id FROM metrics ORDER BY ts DESC LIMIT 1").fetchone(); trans=None
         if row: trans = analyze_outage_transition(int(row[0]))
         if trans=='end':
@@ -966,7 +1130,10 @@ df = fetch_metrics(start_dt, end_dt)
 # Prepare current outages window matching the chart window
 conn_win = _conn()
 if start_dt and end_dt:
-    df_out_current = pd.read_sql_query("SELECT * FROM outages WHERE (start_ts < ?) AND (COALESCE(end_ts, ?) > ?) ORDER BY start_ts ASC", conn_win, params=(end_dt.isoformat(), end_dt.isoformat(), start_dt.isoformat()))
+    df_out_current = pd.read_sql_query(
+        "SELECT * FROM outages WHERE (start_ts < ?) AND (COALESCE(end_ts, ?) > ?) ORDER BY start_ts ASC",
+        conn_win, params=(end_dt.isoformat(), end_dt.isoformat(), start_dt.isoformat())
+    )
 else:
     df_out_current = pd.read_sql_query("SELECT * FROM outages ORDER BY start_ts ASC", conn_win)
 
@@ -1012,7 +1179,11 @@ else:
     total_down = int(df_out["duration_seconds"].fillna(0).sum()); c2.metric("Total downtime", _fmt_dur(total_down))
     max_down = int(df_out["duration_seconds"].fillna(0).max()) if (df_out["duration_seconds"].notna().any()) else 0; c3.metric("Longest outage", _fmt_dur(max_down))
     recent_restore = df_out[df_out["end_ts"].notna()]["end_ts"].max(); c4.metric("Last back online", str(recent_restore) if pd.notna(recent_restore) else "—")
-    st.dataframe(df_out[["start_ts","end_ts","duration","last_online_before","first_online_after","start_sample_id","end_sample_id"]].rename(columns={"start_ts":"Down since","end_ts":"Restored at","duration":"Downtime","last_online_before":"Last Online Before","first_online_after":"First Online After"}), use_container_width=True)
+    st.dataframe(df_out[
+        ["start_ts","end_ts","duration","last_online_before","first_online_after","start_sample_id","end_sample_id"]
+    ].rename(columns={
+        "start_ts":"Down since","end_ts":"Restored at","duration":"Downtime","last_online_before":"Last Online Before","first_online_after":"First Online After"
+    }), use_container_width=True)
     csv_out = df_out.to_csv(index=False).encode("utf-8"); st.download_button("Download outages.csv", data=csv_out, file_name="outages.csv", mime="text/csv")
 
 st.divider()
@@ -1033,7 +1204,11 @@ else:
             x=alt.X("ts:T", title="Time"),
             y=alt.Y("mbps:Q", title="Speed (Mbps)"),
             color=alt.Color("metric:N", title="Metric"),
-            tooltip=[alt.Tooltip("ts:T", title="Time"), alt.Tooltip("metric:N", title="Metric"), alt.Tooltip("mbps:Q", title="Mbps", format=".2f")]
+            tooltip=[
+                alt.Tooltip("ts:T", title="Time"),
+                alt.Tooltip("metric:N", title="Metric"),
+                alt.Tooltip("mbps:Q", title="Mbps", format=".2f")
+            ]
         )
         layers = []
         if not bands_df.empty:
@@ -1045,19 +1220,40 @@ else:
             ))
         if not df_out_current.empty:
             starts_df = pd.DataFrame({"ts": pd.to_datetime(df_out_current["start_ts"].dropna())})
-            layers.append(alt.Chart(starts_df).mark_rule(strokeDash=[6,3], opacity=0.6, color="red").encode(x="ts:T", tooltip=[alt.Tooltip("ts:T", title="Outage start")]))
+            layers.append(alt.Chart(starts_df).mark_rule(strokeDash=[6,3], opacity=0.6, color="red").encode(
+                x="ts:T", tooltip=[alt.Tooltip("ts:T", title="Outage start")]
+            ))
             rdf = df_out_current[["end_ts","duration_seconds"]].copy()
             rdf = rdf[rdf["end_ts"].notna()]
             if not rdf.empty:
-                rdf["ts"] = pd.to_datetime(rdf["end_ts"]); rdf["duration_hr"] = rdf["duration_seconds"].astype(float)/3600.0; rdf = rdf.sort_values("ts"); rdf["avg_duration_hr"] = rdf["duration_hr"].expanding().mean()
-                layers.append(alt.Chart(rdf).mark_rule(strokeDash=[4,4], opacity=0.6, color="green").encode(x="ts:T", tooltip=[alt.Tooltip("ts:T", title="Restore time"), alt.Tooltip("duration_hr:Q", title="Outage (hr)", format=".2f")]))
-                layers.append(alt.Chart(rdf).mark_point(shape="triangle-up", size=70, filled=True, color="green").encode(x="ts:T", y=alt.Y("duration_hr:Q", title="Outage duration (hr)"), tooltip=[alt.Tooltip("ts:T", title="Restore time"), alt.Tooltip("duration_hr:Q", title="Outage (hr)", format=".2f")]))
-                layers.append(alt.Chart(rdf).mark_line(opacity=0.6).encode(x="ts:T", y=alt.Y("avg_duration_hr:Q", title="Avg outage (hr)"), tooltip=[alt.Tooltip("ts:T", title="Restore time"), alt.Tooltip("avg_duration_hr:Q", title="Avg outage (hr)", format=".2f")]))
+                rdf["ts"] = pd.to_datetime(rdf["end_ts"])
+                rdf["duration_hr"] = rdf["duration_seconds"].astype(float)/3600.0
+                rdf = rdf.sort_values("ts")
+                rdf["avg_duration_hr"] = rdf["duration_hr"].expanding().mean()
+                layers.append(alt.Chart(rdf).mark_rule(strokeDash=[4,4], opacity=0.6, color="green").encode(
+                    x="ts:T", tooltip=[
+                        alt.Tooltip("ts:T", title="Restore time"),
+                        alt.Tooltip("duration_hr:Q", title="Outage (hr)", format=".2f")
+                    ]
+                ))
+                layers.append(alt.Chart(rdf).mark_point(shape="triangle-up", size=70, filled=True, color="green").encode(
+                    x="ts:T", y=alt.Y("duration_hr:Q", title="Outage duration (hr)"),
+                    tooltip=[
+                        alt.Tooltip("ts:T", title="Restore time"),
+                        alt.Tooltip("duration_hr:Q", title="Outage (hr)", format=".2f")
+                    ]
+                ))
+                layers.append(alt.Chart(rdf).mark_line(opacity=0.6).encode(
+                    x="ts:T", y=alt.Y("avg_duration_hr:Q", title="Avg outage (hr)"),
+                    tooltip=[
+                        alt.Tooltip("ts:T", title="Restore time"),
+                        alt.Tooltip("avg_duration_hr:Q", title="Avg outage (hr)", format=".2f")
+                    ]
+                ))
         layers.append(speed_lines)
         combined = alt.layer(*layers).resolve_scale(y='independent').properties(height=360)
         st.altair_chart(combined, use_container_width=True)
 
-    # Create and show the exact PNG for THIS window; this is also the email attachment
     chart_png_current = make_combined_chart_image(df, df_out_current)
     if chart_png_current:
         st.image(chart_png_current, caption="Email/Export image (exact attachment for this window)", use_column_width=True)
@@ -1068,8 +1264,12 @@ st.divider()
 # -------- Analytics & Statistics — Bucket table
 st.subheader("Analytics & Statistics — Bucket table")
 connA = _conn()
-# Use df_out_current (already windowed) to build the table so bucket numbers match the current view
-bucket_df_cur = compute_bucket_table(df_out_current, (start_dt.date(), (end_dt - timedelta(days=1)).date()) if (start_dt and end_dt) else (), group_mode, int(n_hours), anchor_dt if 'anchor_dt' in locals() else None)
+bucket_df_cur = compute_bucket_table(
+    df_out_current,
+    (start_dt.date(), (end_dt - timedelta(days=1)).date()) if (start_dt and end_dt) else (),
+    group_mode, int(n_hours),
+    anchor_dt if 'anchor_dt' in locals() else None
+)
 if bucket_df_cur.empty:
     st.info("No outage analytics yet (no outages recorded).")
 else:
@@ -1091,7 +1291,10 @@ try:
     if should_auto:
         end_auto = datetime.now()
         start_auto = end_auto - timedelta(days=1)
-        df_out_auto = pd.read_sql_query("SELECT * FROM outages WHERE (start_ts < ?) AND (COALESCE(end_ts, ?) > ?) ORDER BY start_ts ASC", _conn(), params=(end_auto.isoformat(), end_auto.isoformat(), start_auto.isoformat()))
+        df_out_auto = pd.read_sql_query(
+            "SELECT * FROM outages WHERE (start_ts < ?) AND (COALESCE(end_ts, ?) > ?) ORDER BY start_ts ASC",
+            _conn(), params=(end_auto.isoformat(), end_auto.isoformat(), start_auto.isoformat())
+        )
         bucket_df_auto = compute_bucket_table(df_out_auto, (start_auto.date(), end_auto.date()), "Every N hours", 3, anchor=None)
         df_metrics_auto = fetch_metrics(start_auto, end_auto)
         img = make_combined_chart_image(df_metrics_auto, df_out_auto)
@@ -1099,11 +1302,26 @@ try:
             to_auto = st.secrets.get("report_to", "donhautea@gmail.com")
         except Exception:
             to_auto = "donhautea@gmail.com"
-        okA, msgA = email_bucket_chart_and_summary(to_auto, bucket_df_auto, img, title_suffix="(auto 3h)", df_metrics_24h=df_metrics_auto, df_out_window=df_out_auto)
+        okA, msgA = email_bucket_chart_and_summary(
+            to_auto, bucket_df_auto, img, title_suffix="(auto 3h)",
+            df_metrics_24h=df_metrics_auto, df_out_window=df_out_auto
+        )
         if okA:
             kv_set("last_auto_report_email_ts", float(now_ts))
         st.caption(f"Auto email status: {msgA}")
 except Exception as e:
     st.caption(f"Auto email skipped: {e}")
+
+# -------- Auto Drive sync every 30 minutes --------
+try:
+    last_drive = kv_get("last_drive_sync_ts", 0.0) or 0.0
+    now_s = time.time()
+    if (now_s - float(last_drive)) >= 30*60:  # 30 minutes
+        ok, msg = gdrive_sync_db()
+        if ok:
+            kv_set("last_drive_sync_ts", now_s)
+        st.caption(f"Auto Drive sync: {msg}")
+except Exception as e:
+    st.caption(f"Auto Drive sync skipped: {e}")
 
 st.caption("Shading: **red** = downtime (outage start→restore), **green** = uptime (restore→next outage). Triangles show outage duration at each restore in hours; faint line = running average (hours).")
